@@ -1,0 +1,25 @@
+# Core dependencies
+torch>=2.0.0
+torch-geometric>=2.3.0
+torch-scatter>=2.1.0
+
+# For dataset handling and graph algorithms
+networkx>=2.8
+numpy>=1.21.0
+
+# For SPQR tree decomposition and planar graph preprocessing
+# Note: Sage must be installed via conda/mamba (not pip)
+# Recommended installation:
+#   conda install -c conda-forge mamba  # Install mamba (faster)
+#   mamba install -c conda-forge sage=9.6
+# Or with conda:
+#   conda install -c conda-forge sage=9.6
+sage>=9.6
+
+# Optional: For molecular datasets
+# ogb>=1.3.5
+
+# Development dependencies (optional)
+# pytest>=7.0.0
+# jupyter>=1.0.0
+# matplotlib>=3.5.0

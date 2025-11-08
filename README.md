@@ -2,19 +2,16 @@
 
 **A simplified, easy-to-use interface for PlanE (Representation Learning over Planar Graphs)**
 
-Perfect for users new to planar graph neural networks! No complex configuration flags needed - just plug and play.
-
 ---
 
 ## What is PlanE?
 
-PlanE is a powerful graph neural network designed specifically for **planar graphs** - graphs that can be drawn on a plane without edge crossings. PlanE learns **complete invariants** while remaining practically scalable, inspired by the classical Hopcroft-Tarjan planar graph isomorphism algorithm.
+PlanE is a graph neural network designed specifically for **planar graphs** - graphs that can be drawn on a plane without edge crossings. PlanE learns **complete invariants** while remaining practically scalable, inspired by the classical Hopcroft-Tarjan planar graph isomorphism algorithm.
 
 **Key advantages:**
 - **More expressive** than standard GNNs (GCN, GIN, GAT)
 - **Captures planar structure** through SPQR tree decomposition
 - **Scalable** for real-world graphs
-- **Easy to use** with sensible defaults
 
 ---
 
@@ -53,6 +50,14 @@ pip install -r requirements.txt
 
 # Or install as a package
 pip install -e .
+
+# For full SPQR preprocessing, install Sage (required for production use):
+# First install mamba (faster than conda):
+conda install -c conda-forge mamba
+# Then install Sage:
+mamba install -c conda-forge sage=9.6
+# Or directly with conda:
+conda install -c conda-forge sage=9.6
 ```
 
 ### Basic Usage
@@ -234,130 +239,3 @@ Run an example:
 ```bash
 python examples/train_simple.py --dataset genus_hard --epochs 50
 ```
-
----
-
-## Frequently Asked Questions
-
-### Q: What if my graphs aren't planar?
-
-PlanE is specifically designed for planar graphs. For non-planar graphs, consider:
-- Standard GNNs (GCN, GIN, GAT)
-- More expressive architectures like PPGN or subgraph GNNs
-- Graph transformers
-
-### Q: How do I know if my graph is planar?
-
-```python
-import networkx as nx
-
-G = nx.Graph()
-# ... add edges ...
-
-is_planar = nx.check_planarity(G)[0]
-print(f"Graph is planar: {is_planar}")
-```
-
-### Q: Do I need edge features?
-
-No! PlanE works great with just node features. If you have edge features, set `num_edge_features` appropriately.
-
-### Q: What datasets work well with PlanE?
-
-PlanE excels on:
-- Molecular graphs (many are planar or nearly planar)
-- Road networks
-- Circuit graphs
-- Geographic networks
-- Genus classification tasks
-
-### Q: How does PlanE compare to standard GNNs?
-
-On planar graph tasks, PlanE typically achieves:
-- **Higher expressivity** (can distinguish more graph structures)
-- **Better accuracy** on structure-sensitive tasks
-- **Comparable speed** to 3-4 layer GNNs
-
----
-
-## Troubleshooting
-
-### Error: "Data object missing SPQR attributes"
-
-**Solution:** Your graphs need SPQR preprocessing. Use `preprocess_planar_graphs()`:
-
-```python
-from examples.preprocess_data import preprocess_planar_graphs
-preprocessed = preprocess_planar_graphs(graphs)
-```
-
-### Error: "Graph is not planar"
-
-**Solution:** PlanE only works with planar graphs. Check planarity:
-
-```python
-import networkx as nx
-G = nx.from_edgelist(edge_list)
-is_planar, _ = nx.check_planarity(G)
-```
-
-### Error: "CUDA out of memory"
-
-**Solution:** Reduce batch size or hidden dimension:
-
-```python
-model = PlanE(hidden_dim=32, ...)  # Smaller hidden dim
-loader = DataLoader(dataset, batch_size=16, ...)  # Smaller batch
-```
-
----
-
-## Comparison with Original PlanE
-
-**PlanE Minimal** vs **Original PlanE**:
-
-| Feature | PlanE Minimal | Original PlanE |
-|---------|---------------|----------------|
-| Configuration | Simple, intuitive | Complex flags like `flags_plane_agg="n_t_b"` |
-| Documentation | Extensive examples | Research-focused |
-| Ease of use | Plug-and-play | Requires understanding of internals |
-| Flexibility | Sensible defaults | Highly configurable |
-| Best for | Quick prototyping, new users | Research, fine-tuning |
-
-**When to use PlanE Minimal:**
-- You're new to planar GNNs
-- You want quick results without configuration
-- You're prototyping or teaching
-
-**When to use Original PlanE:**
-- You need fine-grained control over every component
-- You're reproducing research results
-- You're pushing performance limits
-
----
-
-## License
-
-MIT License - see LICENSE file for details.
-
----
-
-## Contributing
-
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new features
-4. Submit a pull request
-
----
-
-## Support
-
-- **Issues:** [GitHub Issues](https://github.com/yourusername/mini-PlanE/issues)
-- **Questions:** [GitHub Discussions](https://github.com/yourusername/mini-PlanE/discussions)
-- **Original PlanE:** [https://github.com/ZZYSonny/PlanE](https://github.com/ZZYSonny/PlanE)
-
----
-
-**Happy learning on planar graphs!**
