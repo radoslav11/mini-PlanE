@@ -104,6 +104,9 @@ def add_spqr_preprocessing_placeholder(data):
     data.bc_edge_index = torch.zeros((2, 0), dtype=torch.long)
     data.cb_edge_index = torch.zeros((2, 0), dtype=torch.long)
 
+    # Batch attribute (all nodes belong to graph 0 for single graph)
+    data.batch = torch.zeros(num_nodes, dtype=torch.long)
+
     return data
 
 

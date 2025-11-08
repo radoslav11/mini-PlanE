@@ -22,6 +22,10 @@ class PlanE(nn.Module):
         num_classes (int): Number of output classes for classification. Default: 2
         num_layers (int): Number of PlanE layers. Default: 3
         dropout (float): Dropout probability. Default: 0.0
+        categorical_node_features (bool): If True, use Embedding for node features (categorical).
+                                          If False, use Linear (continuous). Default: False
+        categorical_edge_features (bool): If True, use Embedding for edge features (categorical).
+                                          If False, use Linear (continuous). Default: False
         use_neighbors (bool): Aggregate from 1-hop neighbors (like GNN). Default: True
         use_triconnected (bool): Aggregate from triconnected components. Default: True
         use_biconnected (bool): Aggregate from biconnected components. Default: True
@@ -47,6 +51,8 @@ class PlanE(nn.Module):
         num_classes=2,
         num_layers=3,
         dropout=0.0,
+        categorical_node_features=False,
+        categorical_edge_features=False,
         use_neighbors=True,
         use_triconnected=True,
         use_biconnected=True,
@@ -65,14 +71,14 @@ class PlanE(nn.Module):
         self.task = task
 
         # Node feature embedding
-        if isinstance(num_node_features, int):
+        if categorical_node_features:
             self.node_embed = nn.Embedding(num_node_features, hidden_dim)
         else:
             self.node_embed = nn.Linear(num_node_features, hidden_dim)
 
         # Edge feature embedding (if needed)
         if num_edge_features > 0:
-            if isinstance(num_edge_features, int):
+            if categorical_edge_features:
                 self.edge_embed = nn.Embedding(num_edge_features, hidden_dim)
             else:
                 self.edge_embed = nn.Linear(num_edge_features, hidden_dim)
@@ -182,13 +188,15 @@ class SimplePlanE(nn.Module):
     Args:
         num_node_features (int): Number of input node features
         num_classes (int): Number of output classes
+        categorical_node_features (bool): If True, use Embedding for node features.
+                                          If False, use Linear. Default: False
 
     Example:
         >>> model = SimplePlanE(num_node_features=1, num_classes=4)
         >>> output = model(data)
     """
 
-    def __init__(self, num_node_features, num_classes):
+    def __init__(self, num_node_features, num_classes, categorical_node_features=False):
         super().__init__()
         self.model = PlanE(
             num_node_features=num_node_features,
@@ -196,6 +204,7 @@ class SimplePlanE(nn.Module):
             hidden_dim=64,
             num_layers=3,
             dropout=0.1,
+            categorical_node_features=categorical_node_features,
             use_neighbors=True,
             use_triconnected=True,
             use_biconnected=True,
