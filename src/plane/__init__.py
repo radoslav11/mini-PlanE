@@ -10,4 +10,10 @@ from   plane.model.layers       import PlaneLayer
 from   plane.model.model        import PlanE, SimplePlanE
 
 __version__ = "0.1.0"
-__all__ = ["PlanE", "SimplePlanE", "PlaneLayer", "planar_preprocess", "DataPlanE"]
+__all__ = [
+    "PlanE",
+    "SimplePlanE",
+    "PlaneLayer",
+    "planar_preprocess",
+    "DataPlanE",
+]

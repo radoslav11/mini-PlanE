@@ -104,7 +104,9 @@ class TriconnectedEncoder(nn.Module):
             ]
         )
 
-        self.bn = nn.LayerNorm(hidden_dim)  # Use LayerNorm instead of BatchNorm to avoid batch size issues
+        self.bn = nn.LayerNorm(
+            hidden_dim
+        )  # Use LayerNorm instead of BatchNorm to avoid batch size issues
 
     def forward(self, data, h_nodes, h_edges=None):
         """
@@ -363,7 +365,9 @@ class PlaneLayer(nn.Module):
         # 2. Aggregate from triconnected components
         if self.use_triconnected:
             h_tri = self.tri_encoder(data, h, edge_attr)
-            h_from_tri = self.tri_aggregator((h_tri, h), edge_index=data.g_read_from_spqr)
+            h_from_tri = self.tri_aggregator(
+                (h_tri, h), edge_index=data.g_read_from_spqr
+            )
             aggregations.append(h_from_tri)
 
         # 3. Aggregate from biconnected components
@@ -373,12 +377,16 @@ class PlaneLayer(nn.Module):
                 h_tri = self.tri_encoder(data, h, edge_attr)
 
             h_bi = self.bi_encoder(data, h_tri)
-            h_from_bi = self.bi_aggregator((h_bi, h), edge_index=data.g_read_from_b)
+            h_from_bi = self.bi_aggregator(
+                (h_bi, h), edge_index=data.g_read_from_b
+            )
             aggregations.append(h_from_bi)
 
         # 4. Aggregate from global readout
         if self.use_global_readout:
-            h_global = self.global_pool(h, data.batch)  # [num_graphs, hidden_dim]
+            h_global = self.global_pool(
+                h, data.batch
+            )  # [num_graphs, hidden_dim]
             h_global = self.global_mlp(h_global)  # [num_graphs, hidden_dim]
             # Broadcast back to nodes
             h_from_global = h_global[data.batch]  # [num_nodes, hidden_dim]

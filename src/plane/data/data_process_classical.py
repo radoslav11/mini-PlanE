@@ -1,8 +1,8 @@
 import itertools
 import typing
 
-import sage.all as sageall
-from sage.graphs import connectivity
+from   sage                     import all as sageall
+from   sage.graphs              import connectivity
 
 SPQR_NODE = typing.Tuple[str, sageall.Graph]
 SPQR_EDGE = typing.Tuple[int, int, typing.Union[None, str]]

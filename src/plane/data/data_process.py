@@ -1,12 +1,10 @@
 import networkx as nx
 import torch
-import torch_geometric.data as tgdata
-import torch_geometric.utils as tgutils
+from   torch_geometric          import data as tgdata, utils as tgutils
 
-import sage.all as sageall
-from sage.graphs import connectivity
+from   sage                     import all as sageall
 
-from plane.data import data_process_classical
+from   plane.data               import data_process_classical
 
 
 class DataPlanE(tgdata.Data):
@@ -258,7 +256,14 @@ def planar_preprocess(data: tgdata.Data, directional_tree=True):
                     )
                 else:
                     spqr_read_from_e.append(
-                        [sub_id, u, v, -1, i, spqr_code[i]]  # -1 indicates virtual edge
+                        [
+                            sub_id,
+                            u,
+                            v,
+                            -1,
+                            i,
+                            spqr_code[i],
+                        ]  # -1 indicates virtual edge
                     )
 
                 if sub_type == "P":
@@ -276,7 +281,14 @@ def planar_preprocess(data: tgdata.Data, directional_tree=True):
                         )
                     else:
                         spqr_read_from_e.append(
-                            [sub_id, v, u, -1, i, spqr_code[i]]  # -1 indicates virtual edge
+                            [
+                                sub_id,
+                                v,
+                                u,
+                                -1,
+                                i,
+                                spqr_code[i],
+                            ]  # -1 indicates virtual edge
                         )
 
             for i in sub.vertex_iterator():
@@ -285,14 +297,19 @@ def planar_preprocess(data: tgdata.Data, directional_tree=True):
         return node_map
 
     add_graph(sageall.Graph(data.edge_index.T.tolist()))
-    num_nodes = data.x.size(0) if data.x is not None else data.edge_index.max().item() + 1
+    num_nodes = (
+        data.x.size(0)
+        if data.x is not None
+        else data.edge_index.max().item() + 1
+    )
     return DataPlanE(
         x=data.x,
         y=data.y,
         edge_index=data.edge_index,
         edge_attr=data.edge_attr,
-        batch=torch.zeros(num_nodes, dtype=torch.long),  # All nodes belong to graph 0
-
+        batch=torch.zeros(
+            num_nodes, dtype=torch.long
+        ),  # All nodes belong to graph 0
         spqr_type=torch.tensor(spqr_type, dtype=torch.long),
         spqr_batch=torch.zeros(spqr_num_nodes, dtype=torch.long),
         spqr_order=torch.tensor(spqr_order, dtype=torch.long),
