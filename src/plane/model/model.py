@@ -2,7 +2,7 @@
 Simplified PlanE model with sensible defaults.
 """
 
-from   plane.layers             import PlaneLayer
+from   plane.model.layers       import PlaneLayer
 import torch
 from   torch                    import nn
 from   torch_geometric          import nn as tgnn
@@ -196,7 +196,9 @@ class SimplePlanE(nn.Module):
         >>> output = model(data)
     """
 
-    def __init__(self, num_node_features, num_classes, categorical_node_features=False):
+    def __init__(
+        self, num_node_features, num_classes, categorical_node_features=False
+    ):
         super().__init__()
         self.model = PlanE(
             num_node_features=num_node_features,

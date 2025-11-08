@@ -41,7 +41,7 @@ class PositionalEncoding(nn.Module):
 
 
 class MLP(nn.Module):
-    """Simple MLP with BatchNorm and ReLU."""
+    """Simple MLP with LayerNorm and ReLU."""
 
     def __init__(self, in_dim, out_dim, hidden_factor=2, dropout=0.0):
         super().__init__()
@@ -49,7 +49,7 @@ class MLP(nn.Module):
             # Simple linear + norm + activation
             self.net = nn.Sequential(
                 nn.Linear(in_dim, out_dim),
-                nn.BatchNorm1d(out_dim),
+                nn.LayerNorm(out_dim),
                 nn.ReLU(),
                 nn.Dropout(dropout),
             )
@@ -58,11 +58,11 @@ class MLP(nn.Module):
             hidden_dim = in_dim * hidden_factor
             self.net = nn.Sequential(
                 nn.Linear(in_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
+                nn.LayerNorm(hidden_dim),
                 nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, out_dim),
-                nn.BatchNorm1d(out_dim),
+                nn.LayerNorm(out_dim),
                 nn.ReLU(),
                 nn.Dropout(dropout),
             )
@@ -104,7 +104,7 @@ class TriconnectedEncoder(nn.Module):
             ]
         )
 
-        self.bn = nn.BatchNorm1d(hidden_dim)
+        self.bn = nn.LayerNorm(hidden_dim)  # Use LayerNorm instead of BatchNorm to avoid batch size issues
 
     def forward(self, data, h_nodes, h_edges=None):
         """
@@ -363,7 +363,7 @@ class PlaneLayer(nn.Module):
         # 2. Aggregate from triconnected components
         if self.use_triconnected:
             h_tri = self.tri_encoder(data, h, edge_attr)
-            h_from_tri = self.tri_aggregator((h_tri, h), data.g_read_from_spqr)
+            h_from_tri = self.tri_aggregator((h_tri, h), edge_index=data.g_read_from_spqr)
             aggregations.append(h_from_tri)
 
         # 3. Aggregate from biconnected components
@@ -373,15 +373,15 @@ class PlaneLayer(nn.Module):
                 h_tri = self.tri_encoder(data, h, edge_attr)
 
             h_bi = self.bi_encoder(data, h_tri)
-            h_from_bi = self.bi_aggregator((h_bi, h), data.g_read_from_b)
+            h_from_bi = self.bi_aggregator((h_bi, h), edge_index=data.g_read_from_b)
             aggregations.append(h_from_bi)
 
         # 4. Aggregate from global readout
         if self.use_global_readout:
-            h_global = self.global_pool(h, data.batch)
-            h_global = self.global_mlp(h_global)
+            h_global = self.global_pool(h, data.batch)  # [num_graphs, hidden_dim]
+            h_global = self.global_mlp(h_global)  # [num_graphs, hidden_dim]
             # Broadcast back to nodes
-            h_from_global = h_global[data.batch]
+            h_from_global = h_global[data.batch]  # [num_nodes, hidden_dim]
             aggregations.append(h_from_global)
 
         # Combine all aggregations
