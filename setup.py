@@ -1,4 +1,4 @@
-from   setuptools               import find_packages, setup
+from setuptools import find_packages, setup
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -7,7 +7,10 @@ setup(
     name="mini-plane",
     version="0.1.0",
     author="PlanE Contributors",
-    description="Simplified interface for PlanE: Representation Learning over Planar Graphs",
+    description=(
+        "Simplified interface for PlanE: Representation Learning over Planar"
+        " Graphs"
+    ),
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/yourusername/mini-PlanE",
@@ -28,19 +31,9 @@ setup(
         "torch>=2.0.0",
         "torch-geometric>=2.3.0",
         "torch-scatter>=2.1.0",
-        "networkx>=2.8",
         "numpy>=1.21.0",
+        "tqdm>=4.64.0",
+        # Sage is required for SPQR preprocessing but is not on PyPI.
+        # Install via conda: conda install -c conda-forge sage=9.6
     ],
-    extras_require={
-        "dev": [
-            "pytest>=7.0.0",
-            "jupyter>=1.0.0",
-            "matplotlib>=3.5.0",
-        ],
-        "preprocessing": [
-            # Sage is required for full SPQR preprocessing
-            # Note: Install via conda: conda install -c conda-forge sage
-            # or from https://www.sagemath.org/download.html
-        ],
-    },
 )

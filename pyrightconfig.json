@@ -1,0 +1,18 @@
+{
+  "include": ["src", "train_p3r.py"],
+  "exclude": [
+    "**/__pycache__",
+    "**/.git",
+    "src/plane/data/data_process_classical.py"
+  ],
+  "reportMissingImports": false,
+  "reportMissingTypeStubs": false,
+  "reportPrivateImportUsage": false,
+  "reportArgumentType": false,
+  "reportGeneralTypeIssues": false,
+  "reportOptionalMemberAccess": false,
+  "reportOptionalSubscript": false,
+  "reportOptionalCall": false,
+  "reportCallIssue": false,
+  "reportOperatorIssue": false
+}

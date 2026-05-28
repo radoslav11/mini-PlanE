@@ -1,23 +1,21 @@
 # mini-PlanE
 
-**A simplified, easy-to-use interface for PlanE (Representation Learning over Planar Graphs)**
+**A minimal implementation of PlanE (Representation Learning over Planar Graphs).**
 
----
+PlanE is a GNN for **planar graphs** that learns complete invariants while
+remaining scalable, inspired by the Hopcroft–Tarjan planar graph isomorphism
+algorithm. Each BasePlanE layer combines five signals: 1-hop neighbors,
+triconnected components (via the SPQR tree + Weinberg canonical walk),
+biconnected components (via bottom-up SPQR-tree message passing), a global sum
+readout, and a cut-subtree encoding on the Block-Cut tree.
 
-## What is PlanE?
-
-PlanE is a graph neural network designed specifically for **planar graphs** - graphs that can be drawn on a plane without edge crossings. PlanE learns **complete invariants** while remaining practically scalable, inspired by the classical Hopcroft-Tarjan planar graph isomorphism algorithm.
-
-**Key advantages:**
-- **More expressive** than standard GNNs (GCN, GIN, GAT)
-- **Captures planar structure** through SPQR tree decomposition
-- **Scalable** for real-world graphs
+This minimal version is a port of upstream
+[ZZYSonny/PlanE](https://github.com/ZZYSonny/PlanE) aligned with paper Section
+5 (BasePlanE) and the per-dataset configs in Appendix D.4.
 
 ---
 
 ## Cite
-
-If you make use of this code, or its accompanying [paper](https://arxiv.org/abs/2307.01180), please cite this work as follows:
 
 ```bibtex
 @inproceedings{DimitrovZAC23,
@@ -31,211 +29,163 @@ If you make use of this code, or its accompanying [paper](https://arxiv.org/abs/
 }
 ```
 
-**Paper:** [https://arxiv.org/abs/2307.01180](https://arxiv.org/abs/2307.01180)
-**Original PlanE Repository:** [https://github.com/ZZYSonny/PlanE](https://github.com/ZZYSonny/PlanE)
+**Paper:** https://arxiv.org/abs/2307.01180
+**Original repository:** https://github.com/ZZYSonny/PlanE
 
 ---
 
-## Quick Start
+## Setup
 
-### Installation
+mini-PlanE depends on **SageMath** for SPQR-tree decomposition (the canonical
+triconnected-component encoder used by `TriEnc` requires Sage's
+`TriconnectivitySPQR`; there is no good pure-Python equivalent). Sage is
+**not on PyPI** — it must be installed through conda-forge.
+
+The recommended setup uses [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html)
+(a small, fast, drop-in conda/mamba replacement):
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/mini-PlanE.git
-cd mini-PlanE
+# 1. Install micromamba (one-time; macOS example, see link above for other OS).
+"${SHELL}" <(curl -L micro.mamba.pm/install.sh)
 
-# Install dependencies
-pip install -r requirements.txt
+# 2. Create an environment with Sage + PyTorch + PyG + scatter.
+micromamba create -n plane -c conda-forge \
+    python=3.11 sage=9.6 \
+    pytorch pytorch_geometric pytorch_scatter \
+    numpy tqdm
 
-# Or install as a package
+# 3. Activate it.
+micromamba activate plane
+
+# 4. Install mini-PlanE in editable mode.
 pip install -e .
-
-# For full SPQR preprocessing, install Sage (required for production use):
-# First install mamba (faster than conda):
-conda install -c conda-forge mamba
-# Then install Sage:
-mamba install -c conda-forge sage=9.6
-# Or directly with conda:
-conda install -c conda-forge sage=9.6
 ```
 
-### Basic Usage
+Alternatives that work the same way (just swap the binary name):
 
-```python
-from plane import PlanE, SimplePlanE
-import torch
-from torch_geometric.data import Data
+```bash
+mamba create -n plane -c conda-forge ...   # if you have mambaforge installed
+conda create -n plane -c conda-forge ...   # slower but works
+```
 
-# Option 1: Ultra-simple (just specify input/output)
-model = SimplePlanE(
-    num_node_features=1,
-    num_classes=4
-)
+A pure-pip install **will not work** because Sage isn't on PyPI. The
+`requirements.txt` in this repo lists pure-Python deps so that
+`pip install -r requirements.txt` works inside an environment that already
+has Sage.
 
-# Option 2: More control with sensible defaults
-model = PlanE(
-    num_node_features=1,
-    num_classes=4,
-    hidden_dim=64,      # Hidden dimension
-    num_layers=3,       # Number of layers
-    dropout=0.1         # Dropout rate
-)
+### Verify the environment
 
-# Forward pass (data must have SPQR preprocessing - see below)
-output = model(data)
+```bash
+python -c "import plane, torch, sage.all; print('ok')"
+pytest tests/                                              # 4 tests, ~6s
 ```
 
 ---
 
-## Training Example
+## Usage
 
 ```python
 import torch
-import torch.nn as nn
-from torch_geometric.loader import DataLoader
-from plane import SimplePlanE
-
-# 1. Prepare your dataset
-# NOTE: Graphs must be preprocessed with SPQR decomposition
-# See examples/preprocess_data.py for details
-from examples.preprocess_data import preprocess_planar_graphs
-
-# Load your planar graphs
-graphs = load_your_planar_graphs()  # List of PyG Data objects
-preprocessed_graphs = preprocess_planar_graphs(graphs)
-
-# 2. Create data loaders
-train_loader = DataLoader(preprocessed_graphs, batch_size=32, shuffle=True)
-
-# 3. Initialize model
-model = SimplePlanE(num_node_features=1, num_classes=4)
-
-# 4. Training loop
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-criterion = nn.CrossEntropyLoss()
-
-model.train()
-for epoch in range(100):
-    total_loss = 0
-    for batch in train_loader:
-        optimizer.zero_grad()
-        out = model(batch)
-        loss = criterion(out, batch.y)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-
-    print(f'Epoch {epoch}: Loss = {total_loss / len(train_loader):.4f}')
-```
-
----
-
-## Understanding the Model
-
-### Architecture Options
-
-PlanE aggregates information from multiple structural levels:
-
-1. **Neighbors** (`use_neighbors=True`): Like standard GNNs, aggregate from 1-hop neighbors
-2. **Triconnected components** (`use_triconnected=True`): Capture fundamental planar structure
-3. **Biconnected components** (`use_biconnected=True`): Capture cut vertices and bridges
-4. **Global readout** (`use_global_readout=True`): Graph-level information
-
-You can enable/disable any combination:
-
-```python
-# Minimal model (just neighbors - equivalent to GNN)
-model = PlanE(
-    num_node_features=1,
-    num_classes=4,
-    use_neighbors=True,
-    use_triconnected=False,
-    use_biconnected=False,
-    use_global_readout=False
-)
-
-# Full model (all structural levels - maximum expressivity)
-model = PlanE(
-    num_node_features=1,
-    num_classes=4,
-    use_neighbors=True,
-    use_triconnected=True,
-    use_biconnected=True,
-    use_global_readout=True
-)
-```
-
-### Model Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `num_node_features` | - | **Required.** Number of node features (or embedding size) |
-| `num_edge_features` | 0 | Number of edge features (0 if no edge features) |
-| `hidden_dim` | 64 | Hidden dimension for all layers |
-| `num_classes` | 2 | Number of output classes |
-| `num_layers` | 3 | Number of PlanE layers |
-| `dropout` | 0.0 | Dropout probability |
-| `use_neighbors` | True | Aggregate from 1-hop neighbors |
-| `use_triconnected` | True | Aggregate from triconnected components |
-| `use_biconnected` | True | Aggregate from biconnected components |
-| `use_global_readout` | True | Use global graph readout |
-| `positional_encoding_dim` | 16 | Dimension for positional encodings |
-| `task` | 'classification' | 'classification' or 'regression' |
-
----
-
-## Data Preprocessing
-
-**Important:** PlanE requires planar graphs to be preprocessed with SPQR tree decomposition.
-
-### Option 1: Use our preprocessing script
-
-```python
-from examples.preprocess_data import preprocess_planar_graphs
 from torch_geometric.data import Data
+from plane import PlanE, planar_preprocess
 
-# Your planar graphs (as PyG Data objects)
-graphs = [
-    Data(x=..., edge_index=..., y=...),
-    Data(x=..., edge_index=..., y=...),
-    ...
-]
+# Build (or load) a planar PyG graph.
+data = Data(
+    x=torch.ones((4, 1)),
+    edge_index=torch.tensor([[0,1,1,2,2,3,3,0],
+                             [1,0,2,1,3,2,0,3]]),
+    y=torch.tensor([0]),
+)
 
-# Preprocess (adds SPQR attributes)
-preprocessed = preprocess_planar_graphs(graphs)
+# Preprocess: SPQR tree + BC tree + canonical codes + batch.
+data = planar_preprocess(data)
 
-# Now ready for PlanE!
-model = SimplePlanE(num_node_features=1, num_classes=4)
-output = model(preprocessed[0])
+model = PlanE(d_node=1, n_cls=4)
+out = model(data)   # shape [1, n_cls]
 ```
 
-### Option 2: Use the full PlanE preprocessing
+### Constructor
 
-If you need the full preprocessing from the original PlanE repository:
+| Argument   | Default | Description                                            |
+| ---------- | ------- | ------------------------------------------------------ |
+| `d_node`   | —       | input node feature dim (Linear projection of `x`)      |
+| `n_cls`    | —       | output dim (classes or regression targets)             |
+| `d_edge`   | 0       | input edge feature dim (>0 enables E-BasePlanE)        |
+| `d_hid`    | 64      | hidden dim                                             |
+| `n_layers` | 2       | number of PlaneLayers                                  |
+| `p_drop`   | 0.0     | dropout probability                                    |
+| `d_pe`     | 16      | positional-encoding dim inside `TriEnc`                |
 
-```bash
-# Clone the original PlanE repo
-git clone https://github.com/ZZYSonny/PlanE.git
+When `d_edge > 0` the model switches to E-BasePlanE: `aggr_neigh` becomes
+`GINEConv` so the 1-hop neighbor messages depend on edge features as well.
 
-# Use their preprocessing
-python -m preprocess.prepare --dataset your_dataset
-```
+Naming follows Hungarian-style prefixes throughout the code: `d_*` for
+dimensions, `n_*` for counts, `p_*` for probabilities, plus tensor shape
+suffixes after `__` (e.g. `h_g__N_D` for node features of shape `[N, D]`).
+See the legend at the top of `src/plane/model/layers.py`.
 
 ---
 
-## Examples
+## Experiments
 
-We provide several complete examples in the `examples/` directory:
+Each script in `experiments/` reproduces one task from the paper. See the
+matching `.md` in `notes/` for the dataset description, the paper-config
+hyperparameter grid, and the exact reproduction commands.
 
-- **`examples/train_simple.py`** - Simple training script for planar graph classification
-- **`examples/preprocess_data.py`** - Data preprocessing utilities
-- **`examples/quickstart.ipynb`** - Interactive Jupyter notebook tutorial
-- **`examples/genus_classification.py`** - Example: classifying graphs by genus
-- **`examples/custom_dataset.py`** - How to use PlanE with your own dataset
+| Script                          | Notes                                | Task                                          |
+| ------------------------------- | ------------------------------------ | --------------------------------------------- |
+| `experiments/train_p3r.py`      | [`notes/p3r.md`](notes/p3r.md)       | P3R planar 3-regular classification (paper §7.1.2) |
+| `experiments/train_zinc.py`     | [`notes/zinc.md`](notes/zinc.md)     | ZINC 12k regression (paper §7.4)              |
+| `experiments/train_polaris.py`  | [`notes/polaris.md`](notes/polaris.md) | Any Polaris regression benchmark (default: TDC `caco2-wang`) — bring-your-own benchmark via `--benchmark <owner/slug>` |
 
-Run an example:
+Scripts can be run from any cwd — they resolve paths relative to the repo
+root (`Path(__file__).resolve().parent.parent`). E.g. from the repo root:
 
 ```bash
-python examples/train_simple.py --dataset genus_hard --epochs 50
+python experiments/train_p3r.py
+python experiments/train_zinc.py --preprocess-only --n-workers 10
+python experiments/train_zinc.py
+python experiments/train_polaris.py                                     # tdcommons/caco2-wang
+python experiments/train_polaris.py --benchmark tdcommons/lipophilicity-astrazeneca
+```
+
+For the Polaris script: `pip install polaris-lib rdkit` (optional extras, not
+in `requirements.txt`).
+
+### Tests
+
+```bash
+pytest tests/        # 4 tests, ~6s wall clock
+```
+
+- `test_model.py` — forward shape, backward gradient flow, and **isomorphism
+  invariance** on K4 (two node-relabelings of the same graph must produce
+  identical model outputs).
+- `test_p3r.py` — trains a tiny PlanE on a 3-class P3R subset (30 graphs) for
+  50 epochs and asserts test accuracy ≥ 0.83.
+
+---
+
+## Layout
+
+```
+src/plane/
+  model/
+    model.py     # PlanE: node embed -> N x PlaneLayer -> JK readout
+    layers.py    # PlaneLayer, TriEnc, BiEnc, CutEnc, make_mlp, PosEnc
+  data/
+    data_process.py            # planar_preprocess + DataPlanE
+    data_process_classical.py  # SPQR / BC-tree canonical encoding (Sage)
+experiments/
+  train_p3r.py                 # P3R training / eval
+  train_zinc.py                # ZINC training / eval, parallel preprocessing
+  train_polaris.py             # Polaris benchmark (SMILES via rdkit -> PyG)
+  plot_zinc.py                 # render ZINC CSV log to PNG
+notes/
+  p3r.md                       # P3R: task, grid, repro commands, results
+  zinc.md                      # ZINC: task, grid, repro commands, results
+  polaris.md                   # Polaris: pipeline, default task, results
+tests/
+  test_model.py                # unit tests (forward / backward / invariance)
+  test_p3r.py                  # P3R-subset training test
 ```

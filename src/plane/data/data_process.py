@@ -1,10 +1,9 @@
-import networkx as nx
 import torch
-from   torch_geometric          import data as tgdata, utils as tgutils
+from torch_geometric import data as tgdata
 
-from   sage                     import all as sageall
+from sage import all as sageall
 
-from   plane.data               import data_process_classical
+from plane.data import data_process_classical
 
 
 class DataPlanE(tgdata.Data):
@@ -343,38 +342,4 @@ def planar_preprocess(data: tgdata.Data, directional_tree=True):
         cb_edge_index=torch.tensor(cb_edge_index, dtype=torch.long)
         .view(-1, 2)
         .mT,
-    )
-
-
-def add_zero_node_attr(data: tgdata.Data):
-    data.x = torch.zeros((data.num_nodes,), dtype=torch.long)
-    return data
-
-
-def add_zero_edge_attr(data: tgdata.Data):
-    data.edge_attr = torch.zeros((data.num_edges,), dtype=torch.long)
-    return data
-
-
-def node_cluster_coefficient_graph(data: tgdata.Data):
-    g_nx = tgutils.to_networkx(data)
-    coeff = nx.algorithms.cluster.clustering(g_nx)
-    return tgdata.Data(
-        x=torch.zeros((data.num_nodes,), dtype=torch.long),
-        edge_index=data.edge_index,
-        edge_attr=torch.zeros((data.num_edges,), dtype=torch.long),
-        y=torch.tensor(
-            [coeff[i] for i in range(data.num_nodes)], dtype=torch.float
-        ),
-    )
-
-
-def graph_cluster_coefficient_graph(data: tgdata.Data):
-    g_nx = tgutils.to_networkx(data)
-    coeff = nx.algorithms.cluster.transitivity(g_nx)
-    return tgdata.Data(
-        x=torch.zeros((data.num_nodes,), dtype=torch.long),
-        edge_index=data.edge_index,
-        edge_attr=torch.zeros((data.num_edges,), dtype=torch.long),
-        y=torch.tensor(coeff, dtype=torch.float),
     )

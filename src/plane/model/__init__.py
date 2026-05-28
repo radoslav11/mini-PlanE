@@ -1,8 +1,5 @@
-"""
-PlanE model implementations.
-"""
+"""PlanE model."""
 
-from   plane.model.layers       import PlaneLayer
-from   plane.model.model        import PlanE, SimplePlanE
+from plane.model.model import PlanE
 
-__all__ = ["PlanE", "SimplePlanE", "PlaneLayer"]
+__all__ = ["PlanE"]

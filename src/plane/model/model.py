@@ -1,222 +1,106 @@
-"""
-Simplified PlanE model with sensible defaults.
+"""PlanE model (Section 5 of Dimitrov et al., 2023).
+
+Stacks BasePlanE PlaneLayers and reads out a graph-level prediction by
+concatenating per-layer sum-pooled node embeddings (jumping knowledge):
+
+    z_G = MLP( || over layers l of sum over u in V_G of h_u_l )
+
+See `plane.model.layers` for the shape-suffix convention (N nodes, E edges,
+G graphs, S SPQR components, B biconnected, D hidden, C classes).
 """
 
-from   plane.model.layers       import PlaneLayer
 import torch
-from   torch                    import nn
-from   torch_geometric          import nn as tgnn
+from torch import nn
+from torch_geometric import nn as tgnn
+
+from plane.model.layers import PlaneLayer
 
 
 class PlanE(nn.Module):
-    """
-    Simplified PlanE: Representation Learning over Planar Graphs
+    """PlanE: Representation Learning over Planar Graphs.
 
-    A complete and efficient graph neural network for planar graphs based on the
-    Hopcroft-Tarjan planar graph isomorphism algorithm.
+    Expects PyG `Data` objects preprocessed with `planar_preprocess`.
 
     Args:
-        num_node_features (int): Number of input node features
-        num_edge_features (int, optional): Number of input edge features. Default: 0
-        hidden_dim (int): Hidden dimension size. Default: 64
-        num_classes (int): Number of output classes for classification. Default: 2
-        num_layers (int): Number of PlanE layers. Default: 3
-        dropout (float): Dropout probability. Default: 0.0
-        categorical_node_features (bool): If True, use Embedding for node features (categorical).
-                                          If False, use Linear (continuous). Default: False
-        categorical_edge_features (bool): If True, use Embedding for edge features (categorical).
-                                          If False, use Linear (continuous). Default: False
-        use_neighbors (bool): Aggregate from 1-hop neighbors (like GNN). Default: True
-        use_triconnected (bool): Aggregate from triconnected components. Default: True
-        use_biconnected (bool): Aggregate from biconnected components. Default: True
-        use_global_readout (bool): Use global graph readout. Default: True
-        positional_encoding_dim (int): Dimension for positional encodings. Default: 16
-        task (str): 'classification' or 'regression'. Default: 'classification'
-
-    Example:
-        >>> model = PlanE(
-        ...     num_node_features=1,
-        ...     num_classes=4,
-        ...     hidden_dim=64,
-        ...     num_layers=3
-        ... )
-        >>> output = model(data)  # data is PyG Data object with SPQR preprocessing
+        d_node    : input node feature dim
+        n_cls     : output dim (classes or regression targets)
+        d_edge    : input edge feature dim (0 = no edge features)
+        d_hid     : hidden dim
+        n_layers  : number of PlaneLayers (paper P3R: 2)
+        p_drop    : dropout probability
+        d_pe      : positional-encoding dim inside TriEnc (paper: 16)
     """
 
     def __init__(
         self,
-        num_node_features,
-        num_edge_features=0,
-        hidden_dim=64,
-        num_classes=2,
-        num_layers=3,
-        dropout=0.0,
-        categorical_node_features=False,
-        categorical_edge_features=False,
-        use_neighbors=True,
-        use_triconnected=True,
-        use_biconnected=True,
-        use_global_readout=True,
-        positional_encoding_dim=16,
-        task="classification",
+        d_node,
+        n_cls,
+        d_edge=0,
+        d_hid=64,
+        n_layers=2,
+        p_drop=0.0,
+        d_pe=16,
     ):
         super().__init__()
+        self.d_node = d_node
+        self.d_edge = d_edge
+        self.d_hid = d_hid
+        self.n_cls = n_cls
+        self.n_layers = n_layers
+        self.p_drop = p_drop
 
-        self.num_node_features = num_node_features
-        self.num_edge_features = num_edge_features
-        self.hidden_dim = hidden_dim
-        self.num_classes = num_classes
-        self.num_layers = num_layers
-        self.dropout = dropout
-        self.task = task
+        self.embed_node = nn.Linear(max(1, d_node), d_hid)
+        self.embed_edge = nn.Linear(d_edge, d_hid) if d_edge > 0 else None
 
-        # Node feature embedding
-        if categorical_node_features:
-            self.node_embed = nn.Embedding(num_node_features, hidden_dim)
-        else:
-            self.node_embed = nn.Linear(num_node_features, hidden_dim)
-
-        # Edge feature embedding (if needed)
-        if num_edge_features > 0:
-            if categorical_edge_features:
-                self.edge_embed = nn.Embedding(num_edge_features, hidden_dim)
-            else:
-                self.edge_embed = nn.Linear(num_edge_features, hidden_dim)
-        else:
-            self.edge_embed = None
-
-        # PlanE layers
         self.layers = nn.ModuleList(
             [
                 PlaneLayer(
-                    hidden_dim=hidden_dim,
-                    dropout=dropout,
-                    use_neighbors=use_neighbors,
-                    use_triconnected=use_triconnected,
-                    use_biconnected=use_biconnected,
-                    use_global_readout=use_global_readout,
-                    positional_encoding_dim=positional_encoding_dim,
+                    d_hid=d_hid, p_drop=p_drop, d_pe=d_pe, d_edge=d_edge
                 )
-                for _ in range(num_layers)
+                for _ in range(n_layers)
             ]
         )
 
-        # Graph-level pooling
-        self.pool = tgnn.global_add_pool
-
-        # Output MLP
-        # We concatenate representations from all layers
-        self.output_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * num_layers, hidden_dim * 2),
-            nn.BatchNorm1d(hidden_dim * 2),
+        # Jumping-knowledge readout: concat per-layer graph reprs -> MLP head.
+        self.pool = tgnn.SumAggregation()
+        self.head = nn.Sequential(
+            nn.Linear(d_hid * n_layers, 2 * d_hid),
+            nn.BatchNorm1d(2 * d_hid),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, num_classes),
+            nn.Dropout(p_drop),
+            nn.Linear(2 * d_hid, n_cls),
         )
 
-        # Task-specific activation
-        if task == "classification":
-            self.final_activation = nn.Identity()  # Use with CrossEntropyLoss
-        else:
-            self.final_activation = nn.Identity()  # For regression
-
     def forward(self, data):
-        """
-        Forward pass through the PlanE model.
+        # data.x   shape [N, d_node]   (with d_node typically = 1 or small)
+        # data.batch shape [N]         (graph id per node)
+        # The pool reduces N -> G via data.batch.
+        h_g__N_D = self.embed_node(data.x)
+        h_e__E_D = (
+            self.embed_edge(data.edge_attr)
+            if self.embed_edge is not None
+            else None
+        )
 
-        Args:
-            data: PyTorch Geometric Data object with SPQR preprocessing.
-                  Must contain: x, edge_index, edge_attr, batch
-                  And SPQR decomposition attributes (added by preprocessing)
-
-        Returns:
-            Tensor: Output predictions of shape [num_graphs, num_classes]
-        """
-        # Embed node features
-        h = self.node_embed(data.x)
-
-        # Embed edge features if available
-        if self.edge_embed is not None and hasattr(data, "edge_attr"):
-            edge_attr = self.edge_embed(data.edge_attr)
-        else:
-            edge_attr = None
-
-        # Store representations from each layer
-        layer_outputs = []
-
-        # Pass through PlanE layers
+        per_layer__list_N_D = []
         for layer in self.layers:
-            h = layer(data, h, edge_attr)
-            layer_outputs.append(h)
+            h_g__N_D = layer(data, h_g__N_D, h_e__E_D)
+            per_layer__list_N_D.append(h_g__N_D)
 
-        # Pool node representations to graph level for each layer
-        graph_reprs = []
-        for h_layer in layer_outputs:
-            graph_repr = self.pool(h_layer, data.batch)
-            graph_reprs.append(graph_repr)
-
-        # Concatenate all layer representations
-        combined = torch.cat(graph_reprs, dim=1)
-
-        # Final prediction
-        out = self.output_mlp(combined)
-        out = self.final_activation(out)
-
-        return out
+        # Each pool: [N, D] -> [G, D]; concat over L layers -> [G, L*D].
+        h_graph__G_LD = torch.cat(
+            [
+                self.pool(h__N_D, data.batch, dim_size=data.num_graphs)
+                for h__N_D in per_layer__list_N_D
+            ],
+            dim=1,
+        )
+        # head: [G, L*D] -> [G, C]
+        return self.head(h_graph__G_LD)
 
     def __repr__(self):
         return (
-            f"PlanE(\n"
-            f"  node_features={self.num_node_features},\n"
-            f"  edge_features={self.num_edge_features},\n"
-            f"  hidden_dim={self.hidden_dim},\n"
-            f"  num_classes={self.num_classes},\n"
-            f"  num_layers={self.num_layers},\n"
-            f"  dropout={self.dropout},\n"
-            f"  task={self.task}\n"
-            f")"
+            f"PlanE(d_node={self.d_node}, d_edge={self.d_edge}, "
+            f"d_hid={self.d_hid}, n_cls={self.n_cls}, "
+            f"n_layers={self.n_layers}, p_drop={self.p_drop})"
         )
-
-
-class SimplePlanE(nn.Module):
-    """
-    Ultra-simple PlanE model with minimal configuration.
-
-    Just specify input/output dimensions and you're good to go!
-    Uses sensible defaults for everything else.
-
-    Args:
-        num_node_features (int): Number of input node features
-        num_classes (int): Number of output classes
-        categorical_node_features (bool): If True, use Embedding for node features.
-                                          If False, use Linear. Default: False
-
-    Example:
-        >>> model = SimplePlanE(num_node_features=1, num_classes=4)
-        >>> output = model(data)
-    """
-
-    def __init__(
-        self, num_node_features, num_classes, categorical_node_features=False
-    ):
-        super().__init__()
-        self.model = PlanE(
-            num_node_features=num_node_features,
-            num_classes=num_classes,
-            hidden_dim=64,
-            num_layers=3,
-            dropout=0.1,
-            categorical_node_features=categorical_node_features,
-            use_neighbors=True,
-            use_triconnected=True,
-            use_biconnected=True,
-            use_global_readout=True,
-            positional_encoding_dim=16,
-            task="classification",
-        )
-
-    def forward(self, data):
-        return self.model(data)
-
-    def __repr__(self):
-        return f"SimplePlanE(model={self.model})"

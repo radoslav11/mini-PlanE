@@ -1,399 +1,358 @@
-"""
-Simplified PlanE layers without complex configuration flags.
+"""PlanE layers (Section 5 of Dimitrov et al., 2023, NeurIPS).
+
+Implements BasePlanE: TriEnc, BiEnc, CutEnc, and the per-layer combine that
+aggregates 1-hop neighbors, triconnected components, biconnected components, a
+global readout, and the cut subtree representation.
+
+Tensor shape suffixes (Hungarian-style; the suffix after `__` lists dims in
+order):
+  N   nodes in the input graph(s), batched
+  E   edges in the input graph(s), batched
+  G   number of input graphs in the batch
+  S   SPQR (triconnected) components, batched
+  B   biconnected components, batched
+  T   edges of the SPQR forest, batched
+  K   entries in `spqr_read_from_e` (one per (component, cycle-edge))
+  D   hidden dim (`d_hid`)
+  P   positional-encoding dim (`d_pe`)
+  C   number of output classes (`n_cls`)
+So e.g. `h_g__N_D` is the node-feature tensor of shape [N, D], `h_b__B_D` is one
+vector per biconnected component, and `id_u__K` is a long tensor of node ids.
+
+Scalar hyperparameter names: `d_hid, d_pe, p_drop, n_layers` etc.
 """
 
 import torch
-from   torch                    import nn
-from   torch_geometric          import nn as tgnn
 import torch_scatter
+from torch import nn
+from torch_geometric import nn as tgnn
 
 
-class PositionalEncoding(nn.Module):
-    """Sinusoidal positional encoding for planar orderings."""
+def PosEnc(d):
+    """Sinusoidal positional encoding p_x (paper Section 5, ref [57]).
 
-    def __init__(self, dim, base_freq=1 / 64):
-        super().__init__()
-        self.dim = dim
-        self.base_freq = base_freq
-
-    def forward(self, x):
-        """
-        Args:
-            x: Tensor of shape [N] containing integer positions
-        Returns:
-            Tensor of shape [N, dim] with sinusoidal encodings
-        """
-        device = x.device
-        x = x.float().unsqueeze(-1)  # [N, 1]
-
-        # Create frequency bands
-        div_term = torch.exp(
-            torch.arange(0, self.dim, 2, device=device)
-            * -(torch.log(torch.tensor(10000.0)) / self.dim)
-        )
-
-        # Compute sinusoidal encodings
-        pe = torch.zeros(x.size(0), self.dim, device=device)
-        pe[:, 0::2] = torch.sin(x * div_term * self.base_freq)
-        pe[:, 1::2] = torch.cos(x * div_term * self.base_freq)
-
-        return pe
-
-
-class MLP(nn.Module):
-    """Simple MLP with LayerNorm and ReLU."""
-
-    def __init__(self, in_dim, out_dim, hidden_factor=2, dropout=0.0):
-        super().__init__()
-        if hidden_factor <= 0:
-            # Simple linear + norm + activation
-            self.net = nn.Sequential(
-                nn.Linear(in_dim, out_dim),
-                nn.LayerNorm(out_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-            )
-        else:
-            # Two-layer MLP
-            hidden_dim = in_dim * hidden_factor
-            self.net = nn.Sequential(
-                nn.Linear(in_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, out_dim),
-                nn.LayerNorm(out_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-            )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class TriconnectedEncoder(nn.Module):
+    Uses the PyG implementation with `base_freq = 1/64` per Appendix D.4
+    ("periodicity of 64"). Stateless apart from a precomputed frequency buffer.
     """
-    Encoder for triconnected components (3-connected subgraphs).
+    return tgnn.PositionalEncoding(d, base_freq=1 / 64)
 
-    This captures the fundamental planar structure through SPQR tree decomposition.
+
+def make_mlp(d_in, d_out, factor_hid=2, p_drop=0.0, norm="batch_norm"):
+    """Two-layer MLP with ReLU. `norm` is "batch_norm" or "none"."""
+
+    def Norm(d_feat):
+        return nn.Identity() if norm == "none" else nn.BatchNorm1d(d_feat)
+
+    d_mid = d_in * factor_hid
+    return nn.Sequential(
+        nn.Linear(d_in, d_mid),
+        Norm(d_mid),
+        nn.ReLU(),
+        nn.Dropout(p_drop),
+        nn.Linear(d_mid, d_out),
+        Norm(d_out),
+        nn.ReLU(),
+        nn.Dropout(p_drop),
+    )
+
+
+class TriEnc(nn.Module):
+    """Triconnected-component encoder. Paper Section 5, TRIENC.
+
+    For each SPQR component C, the canonical Weinberg walk visits nodes
+    omega_0..omega_{k-1} (each edge traversed twice). For position i let
+    kappa_i be the first-visit-order of omega_i. Then
+
+        bh_C = MLP_type(C) ( sum over i of
+                     MLP( h[omega_i] || h_edge_i || PE(kappa_i) || PE(i) ) )
+
+    `h_edge_i` is the input edge feature when the cycle edge is real, or one
+    of two learnable placeholders (`h_virtual` for SPQR virtual edges, `h_edge`
+    for real edges with no provided edge feature). A separate output MLP is
+    applied per SPQR type (S/Q -> 0, P -> 1, R -> 2), followed by BatchNorm.
     """
 
-    def __init__(self, hidden_dim, pe_dim=16, dropout=0.0):
+    def __init__(self, d_hid, d_pe=16, p_drop=0.0):
         super().__init__()
-        self.hidden_dim = hidden_dim
-
-        # Learnable embeddings for virtual edges
-        self.h_virtual = nn.Parameter(torch.randn(hidden_dim))
-
-        # Positional encoding for canonical orderings
-        self.pe = PositionalEncoding(pe_dim)
-
-        # MLP to combine node, edge, and positional features
-        self.combine_mlp = MLP(
-            2 * hidden_dim + 2 * pe_dim,  # node + edge + 2 PEs
-            hidden_dim,
-            hidden_factor=2,
-            dropout=dropout,
+        self.d_hid = d_hid
+        self.h_virtual__D = nn.Parameter(torch.randn(d_hid))
+        self.h_edge__D = nn.Parameter(torch.randn(d_hid))
+        self.pe = PosEnc(d_pe)
+        self.mlp_pre = make_mlp(
+            2 * d_hid + 2 * d_pe,
+            d_hid,
+            factor_hid=2,
+            p_drop=p_drop,
+            norm="batch_norm",
         )
-
-        # Separate MLPs for different component types (S, P, R)
-        self.component_mlps = nn.ModuleList(
+        self.mlp_per_type = nn.ModuleList(
             [
-                MLP(hidden_dim, hidden_dim, hidden_factor=0, dropout=dropout)
+                make_mlp(
+                    d_hid, d_hid, factor_hid=2, p_drop=p_drop, norm="none"
+                )
                 for _ in range(3)
             ]
         )
+        self.bn_out = nn.BatchNorm1d(d_hid)
 
-        self.bn = nn.LayerNorm(
-            hidden_dim
-        )  # Use LayerNorm instead of BatchNorm to avoid batch size issues
-
-    def forward(self, data, h_nodes, h_edges=None):
-        """
-        Encode triconnected components.
-
-        Args:
-            data: PyG Data with SPQR attributes
-            h_nodes: Node embeddings [num_nodes, hidden_dim]
-            h_edges: Edge embeddings [num_edges, hidden_dim] or None
-
-        Returns:
-            Tensor [num_triconnected, hidden_dim]: Component embeddings
-        """
-        # Read SPQR tree structure
-        # spqr_read_from_e contains:
-        #   [0]: component_id, [1]: node_u, [2]: node_v,
-        #   [3]: edge_id (-1 for virtual edges),
-        #   [4]: code1 (position in canonical walk),
-        #   [5]: code2 (kappa[code1])
-        id_spqr, id_u, id_v, id_e, code1, code2 = data.spqr_read_from_e
-
-        # Initialize edge features
-        num_edges_in_components = id_e.size(0)
-        h_component_edges = torch.zeros(
-            num_edges_in_components, self.hidden_dim, device=h_nodes.device
+    def forward(self, data, h_g__N_D, h_e__E_D=None):
+        # spqr_read_from_e rows = [id_spqr, id_u, id_v, id_e, code1, code2]
+        # All have length K (one entry per (component, cycle-edge)).
+        id_spqr__K, id_u__K, _, id_e__K, code1__K, code2__K = (
+            data.spqr_read_from_e
         )
 
-        # Virtual edges get learnable embedding
-        virtual_mask = id_e < 0
-        h_component_edges[virtual_mask] = self.h_virtual
+        # Per-cycle-edge feature tensor.
+        h_cycle__K_D = torch.zeros(
+            id_e__K.size(0), self.d_hid, device=h_g__N_D.device
+        )
+        mask_virtual__K = id_e__K < 0
+        h_cycle__K_D[mask_virtual__K] = self.h_virtual__D
+        if h_e__E_D is None:
+            h_cycle__K_D[~mask_virtual__K] = self.h_edge__D
+        else:
+            h_cycle__K_D[~mask_virtual__K] = h_e__E_D[
+                id_e__K[~mask_virtual__K]
+            ]
 
-        # Real edges get their embeddings
-        if h_edges is not None:
-            h_component_edges[~virtual_mask] = h_edges[id_e[~virtual_mask]]
-
-        # Encode positional information
-        pe1 = self.pe(code1)
-        pe2 = self.pe(code2)
-
-        # Combine: node_u + edge + pos1 + pos2
-        combined = self.combine_mlp(
-            torch.cat([h_nodes[id_u], h_component_edges, pe1, pe2], dim=1)
+        # Inner MLP on (h[omega_i] || h_edge_i || PE(kappa_i) || PE(i)).
+        h_pre__K_D = self.mlp_pre(
+            torch.cat(
+                [
+                    h_g__N_D[id_u__K],
+                    h_cycle__K_D,
+                    self.pe(code2__K),
+                    self.pe(code1__K),
+                ],
+                dim=1,
+            )
         )
 
-        # Aggregate to component level
-        num_components = data.spqr_batch.size(0)
-        component_features = torch_scatter.scatter(
-            combined, id_spqr, dim=0, dim_size=num_components, reduce="add"
+        # Sum over walk positions within each component; per-type outer MLP; BN.
+        n_S = data.spqr_batch.size(0)
+        h_sum__S_D = torch_scatter.scatter(
+            h_pre__K_D, id_spqr__K, dim=0, dim_size=n_S, reduce="add"
         )
-
-        # Apply component-type-specific MLPs
-        out = torch.zeros(
-            num_components, self.hidden_dim, device=h_nodes.device
-        )
-        for component_type in range(3):  # S, P, R types
-            mask = data.spqr_type == component_type
-            if mask.any():
-                out[mask] = self.component_mlps[component_type](
-                    component_features[mask]
+        h_out__S_D = torch.zeros(n_S, self.d_hid, device=h_g__N_D.device)
+        for i_type in range(3):
+            mask_type__S = data.spqr_type == i_type
+            if mask_type__S.any():
+                h_out__S_D[mask_type__S] = self.mlp_per_type[i_type](
+                    h_sum__S_D[mask_type__S]
                 )
-
-        # Batch normalization
-        out = self.bn(out)
-
-        return out
+        return self.bn_out(h_out__S_D)
 
 
-class BiconnectedEncoder(nn.Module):
+class BiEnc(nn.Module):
+    """Biconnected-component encoder. Paper Section 5, BIENC.
+
+    Bottom-up recurrence on the SPQR tree gamma = SPQR(B):
+
+        eh_subtree(C) = MLP( bh_C + sum over C' in children(C) of
+                             MLP( eh_subtree(C') || PE(theta(C, C')) ) )
+
+    and read the root: eh_B = eh_subtree(root). `update` uses GINEConv with
+    Identity NN (so each message is implicitly ReLU(src + PE(theta)) after the
+    next ReLU). `read` aggregates SPQR-tree-root reps into per-biconnected
+    tensors via GINConv on the bipartite edges `b_read_from_spqr_root`.
     """
-    Encoder for biconnected components (2-connected subgraphs).
 
-    Uses recursive message passing on the SPQR tree.
-    """
-
-    def __init__(self, hidden_dim, pe_dim=16, dropout=0.0):
+    def __init__(self, d_hid, p_drop=0.0):
         super().__init__()
-        self.hidden_dim = hidden_dim
-
-        # Positional encoding for tree orderings
-        self.pe = PositionalEncoding(pe_dim)
-
-        # Message passing on SPQR tree
-        self.update_mlp = MLP(
-            hidden_dim + pe_dim, hidden_dim, hidden_factor=2, dropout=dropout
+        self.d_hid = d_hid
+        # PE has width D so GINEConv can sum it with the source feature.
+        self.pe = PosEnc(d_hid)
+        self.update = tgnn.GINEConv(nn.Identity())
+        self.mlp_post = make_mlp(
+            d_hid,
+            d_hid,
+            factor_hid=2,
+            p_drop=p_drop,
+            norm="none",
+        )
+        self.read = tgnn.GINConv(
+            make_mlp(
+                d_hid, d_hid, factor_hid=2, p_drop=p_drop, norm="batch_norm"
+            )
         )
 
-        self.post_update_mlp = MLP(
-            hidden_dim, hidden_dim, hidden_factor=0, dropout=dropout
+    def forward(self, data, h_spqr__S_D):
+        # Work buffer holds in-flight subtree reps while we sweep the tree.
+        h_work__S_D = h_spqr__S_D.clone()
+        pe_theta__T_D = self.pe(data.spqr_edge_attr)
+
+        # Process SPQR tree nodes bottom-up by precomputed `spqr_order`.
+        n_orders = data.spqr_order.max().item() + 1
+        for i_order in range(n_orders):
+            mask_node__S = data.spqr_order == i_order
+            mask_edge__T = mask_node__S[data.spqr_edge_index[1]]
+            h_new__S_D = self.update(
+                h_work__S_D.clone(),
+                edge_index=data.spqr_edge_index[:, mask_edge__T],
+                edge_attr=pe_theta__T_D[mask_edge__T],
+            )
+            h_work__S_D[mask_node__S] = self.mlp_post(h_new__S_D[mask_node__S])
+
+        # Read one vector per biconnected component, from its SPQR root.
+        n_B = data.b_batch.size(0)
+        h_b_init__B_D = torch.zeros(n_B, self.d_hid, device=h_work__S_D.device)
+        return self.read(
+            (h_work__S_D, h_b_init__B_D), data.b_read_from_spqr_root
         )
 
-        # Read from tree root
-        self.read_mlp = MLP(
-            hidden_dim, hidden_dim, hidden_factor=2, dropout=dropout
+
+class CutEnc(nn.Module):
+    """Cut-subtree encoder. Paper Section 5, CUTENC.
+
+    For each cut node u of the Block-Cut tree, compute h_delta(u) for the
+    subtree rooted at u:
+
+        h_delta(u) = MLP( h_u + sum over B in children(u) of
+                          MLP( eh_B + sum over v in children(B) of h_delta(v) ) )
+
+    Realized by alternating updates between B (biconnected) nodes and C (cut)
+    nodes in increasing `b_order` / `c_order`. The returned per-node tensor is
+    zero at non-cut nodes.
+    """
+
+    def __init__(self, d_hid, p_drop=0.0):
+        super().__init__()
+        self.d_hid = d_hid
+        self.update = tgnn.GINConv(nn.Identity())
+        self.mlp_post = make_mlp(
+            d_hid,
+            d_hid,
+            factor_hid=2,
+            p_drop=p_drop,
+            norm="none",
         )
 
-    def forward(self, data, h_triconnected):
-        """
-        Encode biconnected components from triconnected components.
-
-        Args:
-            data: PyG Data with SPQR attributes
-            h_triconnected: Triconnected component embeddings
-
-        Returns:
-            Tensor [num_biconnected, hidden_dim]: Biconnected embeddings
-        """
-        h_spqr = h_triconnected.clone()
-
-        # Positional encodings for tree edges
-        h_spqr_edge = self.pe(data.spqr_edge_attr)
-
-        # Bottom-up message passing on SPQR tree
-        max_order = data.spqr_order.max().item()
-        for cur_order in range(max_order + 1):
-            # Process nodes at this level
-            node_mask = data.spqr_order == cur_order
-
-            # Find edges to children
-            edge_mask = node_mask[data.spqr_edge_index[1]]
-
-            if edge_mask.any():
-                # Aggregate from children
-                src, dst = data.spqr_edge_index[:, edge_mask]
-
-                # Message passing with edge features
-                messages = torch.cat(
-                    [h_spqr[src], h_spqr_edge[edge_mask]], dim=1
-                )
-
-                messages = self.update_mlp(messages)
-
-                # Aggregate messages
-                aggregated = torch_scatter.scatter(
-                    messages, dst, dim=0, dim_size=h_spqr.size(0), reduce="add"
-                )
-
-                # Update nodes
-                h_spqr[node_mask] = h_spqr[node_mask] + self.post_update_mlp(
-                    aggregated[node_mask]
-                )
-
-        # Read from canonical centers to get biconnected representations
-        num_biconnected = data.b_batch.size(0)
-
-        # Initialize biconnected features
-        h_b = torch.zeros(
-            num_biconnected, self.hidden_dim, device=h_spqr.device
+    def forward(self, data, h_g__N_D, h_b__B_D):
+        n_orders = (
+            max(data.b_order.max().item(), data.c_order.max().item()) + 1
         )
 
-        # Read from SPQR tree roots
-        src, dst = data.b_read_from_spqr_root
-        messages = self.read_mlp(h_spqr[src])
-        h_b = torch_scatter.scatter(
-            messages, dst, dim=0, dim_size=num_biconnected, reduce="add"
-        )
+        # Work buffers; messages flow back-and-forth between B and C nodes.
+        h_g_work__N_D = h_g__N_D.clone()
+        h_b_work__B_D = h_b__B_D.clone()
 
-        return h_b
+        for i_order in range(n_orders):
+            # B nodes at this level absorb messages from their child cut nodes.
+            mask_b__B = data.b_order == i_order
+            mask_cb__T = mask_b__B[data.cb_edge_index[1]]
+            h_b_work__B_D = self.update(
+                (h_g_work__N_D, h_b_work__B_D),
+                edge_index=data.cb_edge_index[:, mask_cb__T],
+            )
+            h_b_work__B_D[mask_b__B] = self.mlp_post(h_b_work__B_D[mask_b__B])
+
+            # C nodes at this level absorb messages from their child B nodes.
+            mask_c__N = data.c_order == i_order
+            mask_bc__T = mask_c__N[data.bc_edge_index[1]]
+            h_g_work__N_D = self.update(
+                (h_b_work__B_D, h_g_work__N_D),
+                edge_index=data.bc_edge_index[:, mask_bc__T],
+            )
+            h_g_work__N_D[mask_c__N] = self.mlp_post(
+                h_g_work__N_D[mask_c__N]
+            )
+
+        # Output is zero everywhere except at cut nodes (paper: h_delta(u) is
+        # only defined when u is a cut node; otherwise it contributes nothing).
+        mask_cut__N = data.c_order >= 0
+        h_delta__N_D = torch.zeros_like(h_g__N_D)
+        h_delta__N_D[mask_cut__N] = h_g_work__N_D[mask_cut__N]
+        return h_delta__N_D
 
 
 class PlaneLayer(nn.Module):
-    """
-    Single PlanE layer that aggregates from multiple structural levels.
+    """One BasePlanE layer (Section 5, UPDATE).
 
-    This is the core building block of the PlanE architecture.
+    Concatenates five per-node aggregations and projects back to D:
+
+        h_u_next = f(
+            g1( h_u + sum over neighbors of h_v )         # 1-hop neighbors
+         || g2( sum over all v of h_v )                    # global readout
+         || g3( h_u + sum over C containing u of bh_C )    # triconnected
+         || g4( h_u + sum over B containing u of eh_B )    # biconnected
+         || h_delta(u)                                     # cut subtree
+        )
+
+    g1..g4 are GINConv (`train_eps=True`); the global readout uses
+    DeepSetsAggregation. f is Linear -> BatchNorm -> ReLU -> Dropout.
     """
 
-    def __init__(
-        self,
-        hidden_dim,
-        dropout=0.0,
-        use_neighbors=True,
-        use_triconnected=True,
-        use_biconnected=True,
-        use_global_readout=True,
-        positional_encoding_dim=16,
-    ):
+    def __init__(self, d_hid, p_drop=0.0, d_pe=16, d_edge=0):
         super().__init__()
+        self.d_hid = d_hid
+        self.has_edge_feat = d_edge > 0
 
-        self.hidden_dim = hidden_dim
-        self.use_neighbors = use_neighbors
-        self.use_triconnected = use_triconnected
-        self.use_biconnected = use_biconnected
-        self.use_global_readout = use_global_readout
-
-        # Count number of aggregations for combining later
-        num_aggs = sum(
-            [
-                use_neighbors,
-                use_triconnected,
-                use_biconnected,
-                use_global_readout,
-            ]
-        )
-
-        # 1. Neighbor aggregation (standard GNN)
-        if use_neighbors:
-            self.neighbor_conv = tgnn.GINConv(
-                MLP(hidden_dim, hidden_dim, hidden_factor=2, dropout=dropout),
-                train_eps=True,
+        # All per-aggregation MLPs share shape and use no internal norm
+        # (the layer's `mlp_combine` provides BatchNorm after concat).
+        def gin_mlp():
+            return make_mlp(
+                d_hid, d_hid, factor_hid=2, p_drop=p_drop, norm="none"
             )
 
-        # 2. Triconnected component encoder
-        if use_triconnected:
-            self.tri_encoder = TriconnectedEncoder(
-                hidden_dim, positional_encoding_dim, dropout
-            )
-            self.tri_aggregator = tgnn.GINConv(
-                MLP(hidden_dim, hidden_dim, hidden_factor=2, dropout=dropout),
-                train_eps=True,
-            )
+        # Neighbor aggregation: GINEConv when edge features are present so
+        # messages depend on (h_src + h_edge); plain GINConv otherwise.
+        if self.has_edge_feat:
+            self.aggr_neigh = tgnn.GINEConv(gin_mlp(), train_eps=True)
+        else:
+            self.aggr_neigh = tgnn.GINConv(gin_mlp(), train_eps=True)
+        self.aggr_spqr = tgnn.GINConv(gin_mlp(), train_eps=True)
+        self.aggr_b = tgnn.GINConv(gin_mlp(), train_eps=True)
 
-        # 3. Biconnected component encoder
-        if use_biconnected:
-            self.bi_encoder = BiconnectedEncoder(
-                hidden_dim, positional_encoding_dim, dropout
-            )
-            self.bi_aggregator = tgnn.GINConv(
-                MLP(hidden_dim, hidden_dim, hidden_factor=2, dropout=dropout),
-                train_eps=True,
-            )
+        self.enc_spqr = TriEnc(d_hid, d_pe, p_drop)
+        self.enc_b = BiEnc(d_hid, p_drop)
+        self.enc_gr = tgnn.DeepSetsAggregation(nn.Identity(), gin_mlp())
+        self.enc_cut = CutEnc(d_hid, p_drop)
 
-        # 4. Global readout
-        if use_global_readout:
-            self.global_pool = tgnn.global_add_pool
-            self.global_mlp = MLP(
-                hidden_dim, hidden_dim, hidden_factor=2, dropout=dropout
-            )
-
-        # Combine all aggregations
-        self.combine_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * num_aggs, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+        # f on the concatenation of 5 per-node aggregations.
+        self.mlp_combine = nn.Sequential(
+            nn.Linear(d_hid * 5, d_hid),
+            nn.BatchNorm1d(d_hid),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(p_drop),
         )
 
-    def forward(self, data, h, edge_attr=None):
-        """
-        Forward pass through PlaneLayer.
-
-        Args:
-            data: PyG Data with SPQR preprocessing
-            h: Node features [num_nodes, hidden_dim]
-            edge_attr: Edge features [num_edges, hidden_dim] or None
-
-        Returns:
-            Tensor [num_nodes, hidden_dim]: Updated node features
-        """
-        aggregations = []
-
-        # 1. Aggregate from neighbors
-        if self.use_neighbors:
-            h_neighbors = self.neighbor_conv(h, data.edge_index)
-            aggregations.append(h_neighbors)
-
-        # 2. Aggregate from triconnected components
-        if self.use_triconnected:
-            h_tri = self.tri_encoder(data, h, edge_attr)
-            h_from_tri = self.tri_aggregator(
-                (h_tri, h), edge_index=data.g_read_from_spqr
+    def forward(self, data, h_g__N_D, h_e__E_D=None):
+        # g1: 1-hop neighbors (GINEConv consumes edge features when present).
+        if self.has_edge_feat:
+            h_neigh__N_D = self.aggr_neigh(
+                h_g__N_D, data.edge_index, edge_attr=h_e__E_D
             )
-            aggregations.append(h_from_tri)
+        else:
+            h_neigh__N_D = self.aggr_neigh(h_g__N_D, data.edge_index)
 
-        # 3. Aggregate from biconnected components
-        if self.use_biconnected:
-            # First compute triconnected (needed for biconnected)
-            if not self.use_triconnected:
-                h_tri = self.tri_encoder(data, h, edge_attr)
+        # g2: global readout, broadcast back to nodes
+        h_gr__G_D = self.enc_gr(h_g__N_D, data.batch, dim_size=data.num_graphs)
+        h_gr__N_D = h_gr__G_D[data.batch]
 
-            h_bi = self.bi_encoder(data, h_tri)
-            h_from_bi = self.bi_aggregator(
-                (h_bi, h), edge_index=data.g_read_from_b
+        # g3: triconnected components
+        h_spqr__S_D = self.enc_spqr(data, h_g__N_D, h_e__E_D)
+        h_from_t__N_D = self.aggr_spqr(
+            (h_spqr__S_D, h_g__N_D), edge_index=data.g_read_from_spqr
+        )
+
+        # g4: biconnected components
+        h_b__B_D = self.enc_b(data, h_spqr__S_D)
+        h_from_b__N_D = self.aggr_b(
+            (h_b__B_D, h_g__N_D), edge_index=data.g_read_from_b
+        )
+
+        # Cut subtree representation (zero at non-cut nodes).
+        h_cut__N_D = self.enc_cut(data, h_g__N_D, h_b__B_D)
+
+        return self.mlp_combine(
+            torch.cat(
+                [
+                    h_neigh__N_D,
+                    h_from_t__N_D,
+                    h_from_b__N_D,
+                    h_gr__N_D,
+                    h_cut__N_D,
+                ],
+                dim=1,
             )
-            aggregations.append(h_from_bi)
-
-        # 4. Aggregate from global readout
-        if self.use_global_readout:
-            h_global = self.global_pool(
-                h, data.batch
-            )  # [num_graphs, hidden_dim]
-            h_global = self.global_mlp(h_global)  # [num_graphs, hidden_dim]
-            # Broadcast back to nodes
-            h_from_global = h_global[data.batch]  # [num_nodes, hidden_dim]
-            aggregations.append(h_from_global)
-
-        # Combine all aggregations
-        h_combined = torch.cat(aggregations, dim=1)
-        h_new = self.combine_mlp(h_combined)
-
-        return h_new
+        )

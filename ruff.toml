@@ -1,0 +1,6 @@
+# Excludes the verbatim KHC SPQR/Block-Cut algorithm port (would need extensive
+# refactoring to fix its `l` variable, ENCODING comparisons, etc., and we want
+# to keep it 1:1 with the upstream reference implementation).
+extend-exclude = ["src/plane/data/data_process_classical.py"]
+
+line-length = 100
