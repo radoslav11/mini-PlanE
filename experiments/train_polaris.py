@@ -73,6 +73,67 @@ def _bond_idx(bond_type):
     return BOND_TO_IDX.get(bond_type, N_BOND_TYPE - 1)
 
 
+# Rich-feature vocabularies. Each per-atom / per-bond attribute is one-hot
+# encoded; the per-element vectors are concatenated. Total widths are
+# `N_RICH_ATOM_FEATS` and `N_RICH_BOND_FEATS` below.
+_DEG_BUCKETS  = list(range(6))                              # 0..5+
+_CHG_BUCKETS  = [-2, -1, 0, 1, 2]
+_HYB_BUCKETS  = [
+    Chem.rdchem.HybridizationType.SP,
+    Chem.rdchem.HybridizationType.SP2,
+    Chem.rdchem.HybridizationType.SP3,
+    Chem.rdchem.HybridizationType.SP3D,
+    Chem.rdchem.HybridizationType.SP3D2,
+    Chem.rdchem.HybridizationType.UNSPECIFIED,
+]
+_NUM_HS_BUCKETS = list(range(5))                            # 0..4+
+_STEREO_BUCKETS = [
+    Chem.rdchem.BondStereo.STEREONONE,
+    Chem.rdchem.BondStereo.STEREOZ,
+    Chem.rdchem.BondStereo.STEREOE,
+    Chem.rdchem.BondStereo.STEREOCIS,
+    Chem.rdchem.BondStereo.STEREOTRANS,
+]
+
+
+def _one_hot(value, buckets):
+    """1-D float tensor: one-hot over `buckets`, with a trailing "other" slot."""
+    out = torch.zeros(len(buckets) + 1, dtype=torch.float)
+    try:
+        i = buckets.index(value)
+    except ValueError:
+        i = len(buckets)
+    out[i] = 1.0
+    return out
+
+
+def _atom_rich_feats(atom):
+    return torch.cat([
+        _one_hot(atom.GetAtomicNum(),     ATOM_LIST),           # 13
+        _one_hot(atom.GetDegree(),        _DEG_BUCKETS),         # 7
+        _one_hot(atom.GetFormalCharge(),  _CHG_BUCKETS),         # 6
+        _one_hot(atom.GetHybridization(), _HYB_BUCKETS),         # 7
+        _one_hot(atom.GetTotalNumHs(),    _NUM_HS_BUCKETS),      # 6
+        torch.tensor([float(atom.GetIsAromatic())]),             # 1
+        torch.tensor([float(atom.IsInRing())]),                  # 1
+    ])
+
+
+def _bond_rich_feats(bond):
+    return torch.cat([
+        _one_hot(bond.GetBondType(), BOND_LIST),                 # 5
+        _one_hot(bond.GetStereo(),   _STEREO_BUCKETS),           # 6
+        torch.tensor([float(bond.GetIsConjugated())]),           # 1
+        torch.tensor([float(bond.IsInRing())]),                  # 1
+    ])
+
+
+N_RICH_ATOM_FEATS = len(_atom_rich_feats(Chem.MolFromSmiles("C").GetAtomWithIdx(0)))
+N_RICH_BOND_FEATS = len(_bond_rich_feats(
+    Chem.MolFromSmiles("CC").GetBondWithIdx(0)
+))
+
+
 def smiles_to_pyg(smi, y):
     """SMILES -> PyG Data with int atom/bond labels (1-D long tensors).
 
@@ -105,8 +166,24 @@ def smiles_to_pyg(smi, y):
     )
 
 
+def smiles_to_rich_features(smi):
+    """Return (x_rich [N, N_RICH_ATOM_FEATS], edge_attr_rich [E_dir, N_RICH_BOND_FEATS])
+    in the same node/edge ordering as `smiles_to_pyg`."""
+    mol = Chem.MolFromSmiles(smi)
+    x = torch.stack([_atom_rich_feats(a) for a in mol.GetAtoms()])
+    eattr = []
+    for bond in mol.GetBonds():
+        f = _bond_rich_feats(bond)
+        eattr += [f, f]   # directed: (i,j) and (j,i) get the same edge feat
+    edge_attr = torch.stack(eattr) if eattr else torch.zeros(0, N_RICH_BOND_FEATS)
+    return x, edge_attr
+
+
 # ---------------------------------------------------------------------------
 # Parallel preprocessing
+
+
+_RICH_PREPROCESS = False   # set by main() based on --rich-features
 
 
 def _preprocess_one(args):
@@ -118,17 +195,30 @@ def _preprocess_one(args):
         out = planar_preprocess(d)
     except Exception:
         return None   # non-planar / Sage edge-case
-    out.x = F.one_hot(d.x, N_ATOM_TYPE).float()
-    out.edge_attr = F.one_hot(d.edge_attr, N_BOND_TYPE).float()
+    if _RICH_PREPROCESS:
+        x_rich, edge_attr_rich = smiles_to_rich_features(smi)
+        out.x = x_rich
+        out.edge_attr = edge_attr_rich
+    else:
+        out.x = F.one_hot(d.x, N_ATOM_TYPE).float()
+        out.edge_attr = F.one_hot(d.edge_attr, N_BOND_TYPE).float()
     return out
 
 
-def preprocess_split(items, n_workers, label):
+def _pool_init(rich):
+    """Initializer for multiprocessing workers — replicate the rich flag."""
+    global _RICH_PREPROCESS
+    _RICH_PREPROCESS = rich
+
+
+def preprocess_split(items, n_workers, label, rich):
     """`items` is a list of (smiles, target) tuples."""
+    global _RICH_PREPROCESS
+    _RICH_PREPROCESS = rich
     if n_workers <= 1:
         out = [_preprocess_one(it) for it in tqdm(items, desc=label)]
     else:
-        with mp.Pool(n_workers) as pool:
+        with mp.Pool(n_workers, initializer=_pool_init, initargs=(rich,)) as pool:
             out = list(tqdm(
                 pool.imap(_preprocess_one, items, chunksize=8),
                 total=len(items), desc=label,
@@ -140,8 +230,10 @@ def preprocess_split(items, n_workers, label):
     return [x for x in out if x is not None]
 
 
-def load_or_preprocess(slug, train_items, test_items, cache_root, n_workers):
-    d_cache = cache_root / slug.replace("/", "_")
+def load_or_preprocess(slug, train_items, test_items, cache_root, n_workers,
+                       rich=False):
+    suffix = "_rich" if rich else ""
+    d_cache = cache_root / (slug.replace("/", "_") + suffix)
     p_tr = d_cache / "train.pkl"
     p_te = d_cache / "test.pkl"
     if p_tr.exists() and p_te.exists():
@@ -151,9 +243,9 @@ def load_or_preprocess(slug, train_items, test_items, cache_root, n_workers):
             te = pickle.load(fh)
         return tr, te
     d_cache.mkdir(parents=True, exist_ok=True)
-    print(f"preprocessing [{slug}] with {n_workers} workers...")
-    tr = preprocess_split(train_items, n_workers, "train")
-    te = preprocess_split(test_items, n_workers, "test")
+    print(f"preprocessing [{slug}] (rich={rich}) with {n_workers} workers...")
+    tr = preprocess_split(train_items, n_workers, "train", rich)
+    te = preprocess_split(test_items, n_workers, "test", rich)
     with open(p_tr, "wb") as fh:
         pickle.dump(tr, fh)
     with open(p_te, "wb") as fh:
@@ -221,6 +313,18 @@ def build_argparser():
     p.add_argument("--cache-dir",    type=str,   default=str(ROOT / ".dataset" / "polaris"))
     p.add_argument("--device",       choices=["cpu", "cuda"], default="cpu")
     p.add_argument("--preprocess-only", action="store_true")
+    p.add_argument("--rich-features",   action="store_true",
+                   help="Use rdkit-derived rich atom/bond features instead of "
+                        "atomic-number + bond-type one-hot only.")
+    p.add_argument("--normalize-target", action="store_true",
+                   help="Z-score normalize the regression target on train; "
+                        "un-normalize predictions before metric reporting.")
+    p.add_argument("--n-torch-threads", type=int, default=0,
+                   help="If > 0, torch.set_num_threads(n) to avoid CPU "
+                        "oversubscription when running multiple jobs in parallel.")
+    p.add_argument("--fold", type=str, default="",
+                   help="Cross-validation fold as 'k/K' (e.g. '0/5'). Uses a "
+                        "fixed partition so K runs form a CV ensemble.")
     return p
 
 
@@ -228,8 +332,12 @@ def main():
     args = build_argparser().parse_args()
     device = torch.device(args.device)
     set_seed(args.seed)
+    if args.n_torch_threads > 0:
+        torch.set_num_threads(args.n_torch_threads)
 
-    print(f"benchmark: {args.benchmark}  device: {device}")
+    print(f"benchmark: {args.benchmark}  device: {device}  "
+          f"rich={args.rich_features}  norm={args.normalize_target}  "
+          f"torch_threads={torch.get_num_threads()}")
 
     # --- load benchmark
     # Polaris masks the test targets on purpose — we submit predictions back
@@ -243,10 +351,10 @@ def main():
     test_items  = [(smi, 0.0) for smi in test.inputs]   # pyright: ignore[reportAttributeAccessIssue]
     print(f"  train {len(train_items)}  test {len(test_items)}")
 
-    # --- preprocess (cached)
+    # --- preprocess (cached, separate cache per feature mode)
     tr_ds, te_ds = load_or_preprocess(
         args.benchmark, train_items, test_items,
-        Path(args.cache_dir), args.n_workers,
+        Path(args.cache_dir), args.n_workers, rich=args.rich_features,
     )
     print(f"  after preprocess: train {len(tr_ds)}  test {len(te_ds)}")
 
@@ -254,12 +362,24 @@ def main():
         print("preprocess-only set -> exiting before training.")
         return
 
+    # --- target normalization (z-score on train); used only if --normalize-target
+    y_mean = y_std = None
+    if args.normalize_target:
+        ys = torch.tensor([float(d.y.item()) for d in tr_ds])
+        y_mean = float(ys.mean().item())
+        y_std  = float(ys.std().item()) + 1e-9
+        for d in tr_ds:
+            d.y = (d.y - y_mean) / y_std
+        print(f"  target normalized: mean={y_mean:.4f}  std={y_std:.4f}")
+
     loader_te = DataLoader(te_ds, batch_size=args.n_batch)
 
     # --- model
-    d_edge = 0 if args.no_edge_feat else N_BOND_TYPE
+    d_node_in = N_RICH_ATOM_FEATS if args.rich_features else N_ATOM_TYPE
+    d_edge_in = (0 if args.no_edge_feat
+                 else (N_RICH_BOND_FEATS if args.rich_features else N_BOND_TYPE))
     model = PlanE(
-        d_node=N_ATOM_TYPE, n_cls=1, d_edge=d_edge,
+        d_node=d_node_in, n_cls=1, d_edge=d_edge_in,
         d_hid=args.d_hid, n_layers=args.n_layers, d_pe=args.d_pe,
         p_drop=args.p_drop,
     ).to(device)
@@ -269,8 +389,8 @@ def main():
         )).to(device)
         model(b_warmup)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  model: {n_params:,} params  d_edge={d_edge}  "
-          f"({'E-BasePlanE' if d_edge > 0 else 'BasePlanE'})")
+    print(f"  model: {n_params:,} params  d_node={d_node_in}  d_edge={d_edge_in}  "
+          f"({'E-BasePlanE' if d_edge_in > 0 else 'BasePlanE'})")
 
     # --- optim
     optimizer = optim.Adam(model.parameters(),
@@ -289,13 +409,26 @@ def main():
     writer = csv.writer(f_log)
     writer.writerow(["epoch", "lr", "train_mae", "test_mae", "best_test_mae"])
 
-    # Hold out a small chunk of train for our local "val" MAE (Polaris hides
-    # test labels). The official score comes from `bench.evaluate(preds)`.
-    n_val = max(1, len(tr_ds) // 5)
-    g = torch.Generator().manual_seed(args.seed)
-    perm = torch.randperm(len(tr_ds), generator=g).tolist()
-    ds_val = [tr_ds[i] for i in perm[:n_val]]
-    ds_fit = [tr_ds[i] for i in perm[n_val:]]
+    # Hold out a local "val" set for checkpoint selection (Polaris hides test
+    # labels). With --fold k/K we use fold k of a *fixed* K-way partition, so
+    # K separate runs form a clean cross-validation ensemble; otherwise a
+    # single seeded 20% random split.
+    if args.fold:
+        k_fold, n_folds = (int(v) for v in args.fold.split("/"))
+        g = torch.Generator().manual_seed(20240601)   # fixed: same partition across folds
+        perm = torch.randperm(len(tr_ds), generator=g).tolist()
+        n = len(perm)
+        lo, hi = k_fold * n // n_folds, (k_fold + 1) * n // n_folds
+        val_idx = perm[lo:hi]
+        fit_idx = perm[:lo] + perm[hi:]
+        print(f"  fold {k_fold}/{n_folds}: fit {len(fit_idx)}  val {len(val_idx)}")
+    else:
+        g = torch.Generator().manual_seed(args.seed)
+        perm = torch.randperm(len(tr_ds), generator=g).tolist()
+        n_val = max(1, len(tr_ds) // 5)
+        val_idx, fit_idx = perm[:n_val], perm[n_val:]
+    ds_val = [tr_ds[i] for i in val_idx]
+    ds_fit = [tr_ds[i] for i in fit_idx]
     loader_fit = DataLoader(ds_fit, batch_size=args.n_batch, shuffle=True)
     loader_val = DataLoader(ds_val, batch_size=args.n_batch)
     print(f"  fit {len(ds_fit)}  val {len(ds_val)}  test {len(te_ds)} (labels hidden)")
@@ -336,7 +469,13 @@ def main():
 
     # --- Polaris server-side scoring on the best-val test predictions.
     if test_preds_at_best is not None:
-        results = bench.evaluate(test_preds_at_best.tolist())
+        preds_submit = test_preds_at_best
+        if args.normalize_target and y_std is not None and y_mean is not None:
+            preds_submit = preds_submit * y_std + y_mean
+            # also report the original-scale val MAE for direct comparison
+            print(f"  unnorm val MAE: {mae_best_val * y_std:.4f} "
+                  f"(normalized {mae_best_val:.4f})")
+        results = bench.evaluate(preds_submit.tolist())
         print("\nPolaris evaluate() on test set:")
         print(results)
 
